@@ -1,0 +1,313 @@
+Exemple pratique DDD avec MongoDB (Node.js)
+Ce  document  montre  un  exemple  concret  Domain-Driven  Design  (DDD) appliqué  à  une  petite
+application de gestion de tâches (Task Management). L'objectif : illustrer les concepts de base (Bounded
+Context, Entités, Value Objects, Agrégats, Repositories, Domain Services, Domain Events) et fournir un
+squelette de projet Node.js qui utilise MongoDB comme infrastructure de persistance.
+Contexte métier
+Application : TaskFlow — gérer des tâches pour une équipe. Fonctions principales : créer des tâches,
+attribuer une tâche, changer le statut, ajouter des commentaires, prioriser .
+Bounded Contexts : - User Context : création / gestion des utilisateurs - Task Context : tout le domaine
+des tâches (agrégat Task)
+Ubiquitous Language : Task, User , Assignee, Status, Priority, Comment, Aggregate Root, Repository.
+Arborescence proposée (squelette)
+taskflow/
+├─ src/
+│  ├─ domain/
+│  │  ├─ task/
+│  │  │  ├─ Task.js                # Aggregate root + règles métier
+│  │  │  ├─ TaskId.js              # Value Object
+│  │  │  ├─ TaskStatus.js          # Value Object / Enum
+│  │  │  └─ events/                 # Domain events (TaskCreated, 
+TaskAssigned...)
+│  │  └─ user/
+│  │     ├─ User.js
+│  │     └─ UserId.js
+│  ├─ application/
+│  │  ├─ services/
+│  │  │  └─ TaskCommandService.js  # Use-cases / orchestration
+│  │  └─ dtos/
+│  ├─ infrastructure/
+│  │  ├─ db/
+│  │  │  └─ mongoClient.js         # connexion MongoDB
+│  │  ├─ repositories/
+│  │  │  └─ TaskRepositoryMongo.js
+│  │  └─ events/
+│  ├─ interfaces/
+│  │  └─ http/
+│  │     ├─ controllers/
+│  │     │  └─ tasksController.js
+1
+│  │     └─ routes.js
+│  └─ index.js
+└─ package.json
+1) Domain layer — exemples
+TaskId (Value Object)
+// src/domain/task/TaskId.js
+const{ v4: uuidv4} = require('uuid')
+classTaskId{
+constructor(id) {
+this.id= id||uuidv4()
+}
+toString(){ returnthis.id}
+}
+module.exports= TaskId
+TaskStatus (Value Object / Enum)
+// src/domain/task/TaskStatus.js
+constStatus= Object.freeze({TODO: 'todo', DOING: 'doing', DONE: 'done'})
+module.exports= Status
+Task (Aggregate Root)
+// src/domain/task/Task.js
+constTaskId= require('./TaskId')
+constStatus= require('./TaskStatus')
+classTask{
+constructor({id, title, description, assigneeId= null, priority=
+'normal', status= Status.TODO, comments= [],createdAt= newDate()}){
+this.id= idinstanceofTaskId? id: newTaskId(id)
+this.title= title
+this.description= description
+this.assigneeId= assigneeId
+this.priority= priority
+this.status= status
+this.comments= comments
+this.createdAt= createdAt
+this._events= []// domain events produced
+}
+2
+// règles métier
+assignTo(userId) {
+if(!userId) thrownewError('AssigneeRequired')
+this.assigneeId= userId
+this._events.push({type: 'TaskAssigned', payload: { taskId:
+this.id.toString(),assigneeId: userId} })
+}
+changeStatus(newStatus) {
+if(!Object.values(Status).includes(newStatus))thrownew
+Error('InvalidStatus')
+this.status= newStatus
+this._events.push({type: 'TaskStatusChanged', payload: { taskId:
+this.id.toString(),status: newStatus} })
+}
+addComment(authorId, text) {
+if(!text) thrownewError('CommentEmpty')
+constcomment= { id: `${Date.now()}`, authorId, text, createdAt: new
+Date()}
+this.comments.push(comment)
+this._events.push({type: 'TaskCommentAdded', payload: { taskId:
+this.id.toString(),comment} })
+}
+pullEvents(){ conste = this._events; this._events= [];returne }
+staticfromPersistence(raw) {
+returnnewTask({id: raw._id, title: raw.title, description:
+raw.description, assigneeId: raw.assigneeId, priority: raw.priority, status:
+raw.status, comments: raw.comments||[],createdAt: raw.createdAt})
+}
+}
+module.exports= Task
+Notes : l'agrégat Task encapsule les invariants liés à la tâche (ex : statut valide, assignee requis pour
+certaines transitions, etc.).
+2) Repository interface (contrat)
+Dans DDD, le repository est un contrat côté domaine. Voici un exemple d'interface (pseudo) que l'on
+respecte dans l'infra :
+// src/domain/task/ITaskRepository.js (pseudo-interface)
+classITaskRepository{
+asyncsave(task) { thrownewError('NotImplemented') }
+3
+asyncfindById(taskId) { thrownewError('NotImplemented') }
+asyncfindByAssignee(assigneeId) { thrownewError('NotImplemented') }
+}
+module.exports= ITaskRepository
+3) Infrastructure — implémentation MongoDB
+MongoDB Client (connexions)
+// src/infrastructure/db/mongoClient.js
+const{ MongoClient} = require('mongodb')
+consturi= process.env.MONGO_URI||'mongodb://localhost:27017'
+constclient= newMongoClient(uri)
+asyncfunctionconnect(){
+if(!client.isConnected())awaitclient.connect()
+returnclient.db('taskflow')
+}
+module.exports= { connect}
+Remarque : pour production préférez MongoClient.connect() une fois au démarrage
+et réutiliser l'instance. Utilisez des pools et MONGO_URI sécurisé.
+TaskRepositoryMongo
+// src/infrastructure/repositories/TaskRepositoryMongo.js
+constTask= require('../../domain/task/Task')
+constTaskId= require('../../domain/task/TaskId')
+classTaskRepositoryMongo{
+constructor(db) { this.db= db; this.col= db.collection('tasks') }
+asyncsave(task) {
+constraw= { _id: task.id.toString(),title: task.title, description:
+task.description, assigneeId: task.assigneeId, priority: task.priority,
+status: task.status, comments: task.comments, createdAt: task.createdAt}
+awaitthis.col.updateOne({_id: raw._id},{ $set: raw},{ upsert:
+true})
+}
+asyncfindById(taskId) {
+constraw= awaitthis.col.findOne({_id: taskId.toString()})
+if(!raw) returnnull
+returnTask.fromPersistence(raw)
+}
+4
+asyncfindByAssignee(assigneeId) {
+constcursor= awaitthis.col.find({assigneeId}).toArray()
+returncursor.map(raw=>Task.fromPersistence(raw))
+}
+}
+module.exports= TaskRepositoryMongo
+4) Application layer — Use case / Command Service
+Le service d'application orchestre l'usage du repository et applique des règles de domaine.
+// src/application/services/TaskCommandService.js
+classTaskCommandService{
+constructor({taskRepository, eventBus}){
+this.taskRepository= taskRepository
+this.eventBus= eventBus
+}
+asynccreateTask({title, description, priority}){
+constTask= require('../../domain/task/Task')
+consttask= newTask({title, description, priority})
+awaitthis.taskRepository.save(task)
+constevents= task.pullEvents()
+awaitthis.eventBus.publish(events)
+returntask
+}
+asyncassignTask({taskId, userId}){
+consttask= awaitthis.taskRepository.findById(taskId)
+if(!task) thrownewError('TaskNotFound')
+task.assignTo(userId)
+awaitthis.taskRepository.save(task)
+awaitthis.eventBus.publish(task.pullEvents())
+returntask
+}
+asyncaddComment({taskId, authorId, text}){
+consttask= awaitthis.taskRepository.findById(taskId)
+if(!task) thrownewError('TaskNotFound')
+task.addComment(authorId, text)
+awaitthis.taskRepository.save(task)
+awaitthis.eventBus.publish(task.pullEvents())
+returntask
+}
+}
+5
+module.exports= TaskCommandService
+5) Event Bus simple (Infra)
+// src/infrastructure/events/eventBusSimple.js
+classEventBusSimple{
+constructor(){ this.handlers= []}
+subscribe(handler) { this.handlers.push(handler) }
+asyncpublish(events) {
+for(conste ofevents) {
+for(consth ofthis.handlers) awaith(e)
+}
+}
+}
+module.exports= EventBusSimple
+Utilisé pour pousser des notifications, logs, projections, etc.
+6) Interfaces — Controller HTTP (Express)
+// src/interfaces/http/controllers/tasksController.js
+constexpress= require('express')
+functionmakeTasksController({taskCommandService}){
+constrouter= express.Router()
+router.post('/', async(req, res) =>{
+try{
+consttask= awaittaskCommandService.createTask(req.body)
+res.status(201).send({id: task.id.toString(),title: task.title})
+} catch(err) { res.status(400).send({error: err.message})}
+})
+router.post('/:id/assign', async(req, res) =>{
+try{
+consttask= awaittaskCommandService.assignTask({taskId:
+req.params.id, userId: req.body.userId})
+res.send({id: task.id.toString(),assignee: task.assigneeId})
+} catch(err) { res.status(400).send({error: err.message})}
+})
+router.post('/:id/comments', async(req, res) =>{
+try{
+consttask= awaittaskCommandService.addComment({taskId:
+6
+req.params.id, authorId: req.body.authorId, text: req.body.text})
+res.status(201).send({comments: task.comments})
+} catch(err) { res.status(400).send({error: err.message})}
+})
+returnrouter
+}
+module.exports= makeTasksController
+7) Démarrage de l'app (bootstrap)
+// src/index.js
+constexpress= require('express')
+const{ connect} = require('./infrastructure/db/mongoClient')
+constTaskRepositoryMongo= require('./infrastructure/repositories/
+TaskRepositoryMongo')
+constEventBusSimple= require('./infrastructure/events/eventBusSimple')
+constTaskCommandService= require('./application/services/
+TaskCommandService')
+constmakeTasksController= require('./interfaces/http/controllers/
+tasksController')
+asyncfunctionmain(){
+constdb= awaitconnect()
+consttaskRepo= newTaskRepositoryMongo(db)
+consteventBus= newEventBusSimple()
+// Exemple: subscribe to events
+eventBus.subscribe(async(evt) =>console.log('Event reçu:', evt))
+consttaskService= newTaskCommandService({taskRepository: taskRepo,
+eventBus})
+constapp= express()
+app.use(express.json())
+app.use('/tasks', makeTasksController({taskCommandService: taskService}))
+app.listen(3000, ()=>console.log('TaskFlow listening on :3000'))
+}
+main().catch(console.error)
+7
+8) Transactions et consistance
+Utiliser les transactions MongoDB (sessions) pour des cas multi-documents (ex : transfert de
+propriété, opérations financières). Dans cet exemple simple, chaque tâche est mono-document.
+Si vous avez des invariants couvrant plusieurs collections, encapsulez-les via application service
+et utilisez session.startTransaction() dans l'infra.
+9) Tests unitaires (exemples)
+Tester l'agrégat Task (règles métier) sans DB (pure unit test)
+Mock du repository pour tester le service d'application
+Exemple simple (jest) : 
+constTask= require('../../src/domain/task/Task')
+test('assign to sets assignee and emits event', ()=>{
+consttask= newTask({title: 't', description: 'd'})
+task.assignTo('user-1')
+expect(task.assigneeId).toBe('user-1')
+constevents= task.pullEvents()
+expect(events.some(e =>e.type==='TaskAssigned')).toBe(true)
+})
+10) Projections / Read models
+Pour les lectures optimisées, créez des projections (read models) alimentées par les domain events. Par
+exemple une collection task_read pré-calculée.
+11) Bonnes pratiques DDD appliquées
+Séparer clairement Domain / Application / Infra / Interfaces
+Modéliser les invariants dans les agrégats
+Repository retourne des agrégats, cache la persistance
+EventBus découple effets secondaires
+Keep it modular : chaque Bounded Context dans un package/repo séparé si nécessaire
+12) Extensions possibles
+CQRS : séparer writes (command handlers) des reads (projections + query handlers)
+Event sourcing : stocker uniquement les events et reconstruire l'agrégat
+Utiliser TypeScript pour types forts
+Ajouter validation (class-validator), logging, monitoring
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+• 
+8
+Conclusion
+Ce guide fournit un exemple concret de mise en œuvre des bases du DDD avec MongoDB. Tu peux : -
+Transformer  l'exemple  en  projet  réel  -  Ajouter  validation,  sécurité  (JWT),  webhooks,  notifications  -
+Étendre avec CQRS + Event Sourcing si besoin
+Si tu veux, je peux maintenant : - Générer le code complet prêt à exécuter (package.json, scripts,
+dépendances)  -  Convertir  en  TypeScript  -  Ajouter  tests  unitaires  et  d'intégration  (avec  MongoDB
+Memory Server) - Créer un TP pas à pas expliquant chaque fichier
+Quelle suite souhaites-tu ?
+9
